@@ -668,12 +668,14 @@ def get_operating_summary(
         StockMovementModel.movement_type == "sale_deduction"
     ).all()
 
-    total_cogs_paisa = 0
+    cogs_acc = next((a for a in accounts if a.code == StandardAccount.COGS.value), None)
+    total_cogs_paisa = cogs_acc.current_balance_paisa if (cogs_acc and cogs_acc.current_balance_paisa > 0) else 0
     cost_data_incomplete = False
     for sm in sale_movements:
         p = product_map.get(sm.product_id)
         if p and p.cost_price_paisa is not None:
-            total_cogs_paisa += abs(sm.quantity_change) * p.cost_price_paisa
+            if not (cogs_acc and cogs_acc.current_balance_paisa > 0):
+                total_cogs_paisa += abs(sm.quantity_change) * p.cost_price_paisa
         else:
             cost_data_incomplete = True
 

@@ -337,9 +337,14 @@ def submit_portal_dispute(
 
 # --- 3. SSLCOMMERZ Connector Endpoints ---
 
+def _sslcommerz_base_url() -> str:
+    return "https://sandbox.sslcommerz.com" if settings.SSLCOMMERZ_IS_SANDBOX else "https://securepay.sslcommerz.com"
+
+
 @actions_router.post("/portal/{token}/pay")
 def initiate_customer_payment(
     token: str,
+    request: Request,
     db: Session = Depends(get_db),
 ):
     pt = db.query(CustomerPortalTokenModel).filter(CustomerPortalTokenModel.token == token).first()
@@ -348,7 +353,59 @@ def initiate_customer_payment(
 
     if is_expired(pt.expires_at):
         raise HTTPException(status_code=410, detail="This invoice link has expired.")
-    raise HTTPException(status_code=503, detail="Online payment initiation is not connected to a verified gateway provider. No payment was initiated.")
+
+    store_id = settings.SSLCOMMERZ_STORE_ID.strip()
+    store_passwd = settings.SSLCOMMERZ_STORE_PASSWD.strip()
+    if not store_id or not store_passwd:
+        raise HTTPException(status_code=503, detail="Online payment initiation is not connected to a verified gateway provider. No payment was initiated.")
+
+    import httpx
+    from decimal import Decimal
+    party = db.query(PartyModel).filter_by(id=pt.party_id, tenant_id=pt.tenant_id).first()
+    if party:
+        verify_tenant_ownership(party.tenant_id, pt.tenant_id)
+    amount_bdt = f"{(Decimal(pt.amount_paisa) / Decimal(100)):.2f}"
+    tran_id = f"SHG-{pt.id[:8].upper()}-{secrets.token_hex(4).upper()}"
+    base_cb = str(request.base_url).rstrip("/")
+    form_data = {
+        "store_id": store_id,
+        "store_passwd": store_passwd,
+        "total_amount": amount_bdt,
+        "currency": "BDT",
+        "tran_id": tran_id,
+        "success_url": f"{base_cb}/api/v1/payments/sslcommerz/ipn",
+        "fail_url": f"{base_cb}/pay/{token}",
+        "cancel_url": f"{base_cb}/pay/{token}",
+        "ipn_url": f"{base_cb}/api/v1/payments/sslcommerz/ipn",
+        "cus_name": party.name if party else "Customer",
+        "cus_phone": (party.phone if party and party.phone else "01700000000"),
+        "cus_email": "portal@shongoti.local",
+        "cus_add1": "Dhaka",
+        "cus_city": "Dhaka",
+        "cus_country": "Bangladesh",
+        "shipping_method": "NO",
+        "product_name": f"Invoice {pt.invoice_number}",
+        "product_category": "MSME Invoice",
+        "product_profile": "general",
+        "value_a": token,
+        "value_b": pt.tenant_id,
+    }
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            resp = client.post(f"{_sslcommerz_base_url()}/gwprocess/v4/api.php", data=form_data)
+            payload = resp.json() if resp.is_success else {}
+    except Exception:
+        raise HTTPException(status_code=503, detail="Payment gateway session creation failed.")
+    gateway_url = payload.get("GatewayPageURL")
+    if payload.get("status") != "SUCCESS" or not gateway_url:
+        raise HTTPException(status_code=503, detail="Payment gateway rejected session initiation.")
+    return {
+        "status": "initiated",
+        "tran_id": tran_id,
+        "gateway_url": gateway_url,
+        "amount_paisa": pt.amount_paisa,
+    }
+
 
 @actions_router.post("/payments/sslcommerz/ipn")
 async def sslcommerz_ipn(
@@ -357,7 +414,87 @@ async def sslcommerz_ipn(
 ):
     """
     Handles SSLCOMMERZ IPN Webhook and Callback.
-    Validates amount, currency, merchant store, and duplicate transaction.
-    Atomically records ledger posting and reduces customer due.
+    Validates amount, currency, merchant store, and duplicate transaction via server-to-server Order Validation API.
+    Atomically records pending-settlement ledger posting and reduces customer due.
     """
-    raise HTTPException(status_code=503, detail="Gateway server-to-server validation is not implemented. Unverified callbacks cannot post money.")
+    store_id = settings.SSLCOMMERZ_STORE_ID.strip()
+    store_passwd = settings.SSLCOMMERZ_STORE_PASSWD.strip()
+    if not store_id or not store_passwd:
+        raise HTTPException(status_code=503, detail="Gateway server-to-server validation is not implemented. Unverified callbacks cannot post money.")
+
+    import httpx
+    from decimal import Decimal, InvalidOperation
+    content_type = request.headers.get("content-type", "")
+    if "application/json" in content_type:
+        data = await request.json()
+    else:
+        form = await request.form()
+        data = dict(form)
+
+    token = str(data.get("token") or data.get("value_a") or "").strip()
+    tran_id = str(data.get("tran_id") or "").strip()
+    val_id = str(data.get("val_id") or "").strip()
+    if not token or not tran_id or not val_id:
+        raise HTTPException(status_code=400, detail="Missing required gateway validation parameters (token, tran_id, val_id).")
+
+    pt = db.query(CustomerPortalTokenModel).filter(CustomerPortalTokenModel.token == token).with_for_update().first()
+    if not pt or pt.is_revoked:
+        raise HTTPException(status_code=404, detail="Invalid or revoked portal invoice token.")
+
+    event_id = f"sslcommerz:{tran_id}"
+    existing_entry = db.query(JournalEntryModel).filter_by(tenant_id=pt.tenant_id, event_id=event_id).first()
+    if existing_entry or pt.is_paid:
+        return {"status": "already_processed", "tran_id": tran_id}
+
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            v_resp = client.get(
+                f"{_sslcommerz_base_url()}/validator/api/validationserverAPI.php",
+                params={"val_id": val_id, "store_id": store_id, "store_passwd": store_passwd, "v": "1", "format": "json"},
+            )
+            verified = v_resp.json() if v_resp.is_success else {}
+    except Exception:
+        raise HTTPException(status_code=503, detail="Gateway validation server unreachable.")
+
+    if verified.get("status") not in ("VALID", "VALIDATED") or verified.get("tran_id") != tran_id:
+        raise HTTPException(status_code=400, detail="Gateway transaction validation failed.")
+    if str(verified.get("currency_type") or verified.get("currency") or "").upper() != "BDT":
+        raise HTTPException(status_code=400, detail="Currency mismatch in gateway validation.")
+    if str(verified.get("risk_level") or "0") not in ("0", ""):
+        raise HTTPException(status_code=400, detail="High-risk transaction requires manual settlement review.")
+    try:
+        verified_paisa = int((Decimal(str(verified.get("amount", "0"))) * 100).to_integral_exact())
+    except (InvalidOperation, ValueError):
+        raise HTTPException(status_code=400, detail="Invalid amount returned by gateway validation.")
+    if verified_paisa != pt.amount_paisa:
+        raise HTTPException(status_code=400, detail="Validated payment amount does not match invoice amount.")
+
+    party = db.query(PartyModel).filter_by(id=pt.party_id, tenant_id=pt.tenant_id).with_for_update().first()
+    if not party:
+        raise HTTPException(status_code=404, detail="Customer party not found.")
+    verify_tenant_ownership(party.tenant_id, pt.tenant_id)
+
+    pending_acc = MerchantService.get_or_create_account(
+        db, pt.tenant_id, StandardAccount.PENDING_GATEWAY.value, "Pending Gateway Settlement", "asset"
+    )
+    rec_acc = MerchantService.get_or_create_account(
+        db, pt.tenant_id, StandardAccount.RECEIVABLES.value, "Accounts Receivable", "asset"
+    )
+    entry = JournalEntryModel(
+        tenant_id=pt.tenant_id,
+        entry_number="GW-" + tran_id[-10:].upper(),
+        event_id=event_id,
+        description=f"Verified SSLCOMMERZ payment for invoice {pt.invoice_number}",
+    )
+    db.add(entry)
+    db.flush()
+    db.add_all([
+        PostingModel(journal_entry_id=entry.id, account_id=pending_acc.id, direction="debit", amount_paisa=verified_paisa),
+        PostingModel(journal_entry_id=entry.id, account_id=rec_acc.id, direction="credit", amount_paisa=verified_paisa),
+    ])
+    pending_acc.current_balance_paisa += verified_paisa
+    rec_acc.current_balance_paisa = max(0, rec_acc.current_balance_paisa - verified_paisa)
+    party.current_due_paisa = max(0, party.current_due_paisa - verified_paisa)
+    pt.is_paid = True
+    db.commit()
+    return {"status": "settled_to_pending_gateway", "tran_id": tran_id, "entry_id": entry.id}

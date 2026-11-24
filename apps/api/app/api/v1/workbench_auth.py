@@ -33,6 +33,9 @@ def throttle(request, scope_suffix: str = ''):
     if origin and origin not in set(settings.cors_origins)|{str(request.base_url).rstrip('/')}:
         raise HTTPException(403,'Same-origin authentication required.')
     host = request.client.host if request.client else 'local'
+    forwarded = request.headers.get('x-forwarded-for', '').split(',')[0].strip()
+    if forwarded and host in ('127.0.0.1', '::1', 'localhost'):
+        host = forwarded
     key = f"{host}:{scope_suffix}" if scope_suffix else host
     now = time.monotonic()
     with _lock:
@@ -95,7 +98,7 @@ def response(user, db, http_response=None):
 
 @workbench_auth_router.post('/register', status_code=201)
 def register(payload:Register, request:Request, http_response:Response, db:Session=Depends(get_db)):
-    throttle(request)
+    throttle(request, scope_suffix=payload.phone[:20])
     phone=phone_number(payload.phone)
     if len(payload.name.strip())<2 or len(payload.shop_name.strip())<2: raise HTTPException(400,'Enter your name and shop name.')
     if db.query(UserCredentialModel).filter_by(phone=phone).first(): raise HTTPException(409,'Account already exists. Sign in instead.')
